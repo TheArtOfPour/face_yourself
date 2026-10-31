@@ -6,8 +6,12 @@
 
 extern "C" void *face_detection_create(void)
 {
-    return new (std::nothrow) HumanFaceDetect(
+    auto *detector = new (std::nothrow) HumanFaceDetect(
         HumanFaceDetect::ESPDET_PICO_224_224_FACE, false);
+    if (detector != nullptr) {
+        detector->set_score_thr(0.30f);
+    }
+    return detector;
 }
 
 extern "C" size_t face_detection_run(void *detector, const uint16_t *pixels,

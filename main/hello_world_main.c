@@ -13,6 +13,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_lcd_touch_xpt2046.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -247,6 +248,7 @@ void app_main(void)
 
     bool was_touched = false;
     size_t previous_face_count = SIZE_MAX;
+    uint32_t frames_since_detector_status = 0;
     while (true) {
         camera_fb_t *frame = esp_camera_fb_get();
         if (frame == NULL) {
@@ -260,14 +262,22 @@ void app_main(void)
             const uint16_t *source_pixels = (const uint16_t *)frame->buf;
             face_detection_box_t detected_faces[MAX_DETECTED_FACES];
             size_t face_count = 0;
+            uint32_t inference_time_ms = 0;
             if (face_detector != NULL) {
+                const int64_t inference_start_us = esp_timer_get_time();
                 face_count = face_detection_run(face_detector, source_pixels,
                                                 CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT,
                                                 detected_faces, MAX_DETECTED_FACES);
+                inference_time_ms = (uint32_t)((esp_timer_get_time() - inference_start_us) / 1000);
             }
             if (face_count != previous_face_count) {
                 ESP_LOGI(TAG, "Faces detected: %zu", face_count);
                 previous_face_count = face_count;
+            }
+            if (++frames_since_detector_status >= 20) {
+                ESP_LOGI(TAG, "Detector active: faces=%zu inference=%ums",
+                         face_count, (unsigned)inference_time_ms);
+                frames_since_detector_status = 0;
             }
             face_overlay_box_t overlay_boxes[MAX_DETECTED_FACES];
             const size_t overlay_count = map_face_boxes(
