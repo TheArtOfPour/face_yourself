@@ -4,6 +4,7 @@
 
 #include "driver/spi_master.h"
 #include "esp_camera.h"
+#include "face_detection.h"
 #include "esp_err.h"
 #include "esp_lcd_ili9341.h"
 #include "esp_lcd_io_spi.h"
@@ -24,6 +25,7 @@
 #define CAMERA_FRAME_HEIGHT 240
 #define CAMERA_CROP_WIDTH 180
 #define CAMERA_CROP_X ((CAMERA_FRAME_WIDTH - CAMERA_CROP_WIDTH) / 2)
+#define MAX_DETECTED_FACES 4
 
 #define PIN_NUM_LCD_SCLK 7
 #define PIN_NUM_LCD_MISO 8
@@ -50,6 +52,55 @@
 static const char *TAG = "camera_lcd";
 static uint16_t clear_pixels[LCD_H_RES * LCD_CLEAR_BAND_HEIGHT];
 static SemaphoreHandle_t lcd_transfer_done;
+
+typedef struct {
+    int left;
+    int top;
+    int right;
+    int bottom;
+} face_overlay_box_t;
+
+static size_t map_face_boxes(const face_detection_box_t *face_boxes, size_t face_count,
+                             face_overlay_box_t *overlay_boxes, size_t capacity)
+{
+    size_t overlay_count = 0;
+    const int crop_right = CAMERA_CROP_X + CAMERA_CROP_WIDTH;
+    for (size_t index = 0; index < face_count && overlay_count < capacity; index++) {
+        const face_detection_box_t *face = &face_boxes[index];
+        if (face->x2 < CAMERA_CROP_X || face->x1 >= crop_right ||
+            face->y2 < 0 || face->y1 >= CAMERA_FRAME_HEIGHT) {
+            continue;
+        }
+
+        face_overlay_box_t *overlay = &overlay_boxes[overlay_count];
+        overlay->left = (face->x1 - CAMERA_CROP_X) * LCD_H_RES / CAMERA_CROP_WIDTH;
+        overlay->right = (face->x2 - CAMERA_CROP_X) * LCD_H_RES / CAMERA_CROP_WIDTH;
+        overlay->top = face->y1 * LCD_V_RES / CAMERA_FRAME_HEIGHT;
+        overlay->bottom = face->y2 * LCD_V_RES / CAMERA_FRAME_HEIGHT;
+
+        if (overlay->left < 0) overlay->left = 0;
+        if (overlay->top < 0) overlay->top = 0;
+        if (overlay->right >= LCD_H_RES) overlay->right = LCD_H_RES - 1;
+        if (overlay->bottom >= LCD_V_RES) overlay->bottom = LCD_V_RES - 1;
+        if (overlay->left <= overlay->right && overlay->top <= overlay->bottom) {
+            overlay_count++;
+        }
+    }
+    return overlay_count;
+}
+
+static bool is_face_edge_pixel(int x, int y, const face_overlay_box_t *boxes, size_t box_count)
+{
+    for (size_t index = 0; index < box_count; index++) {
+        const face_overlay_box_t *box = &boxes[index];
+        if (x >= box->left && x <= box->right && y >= box->top && y <= box->bottom &&
+            (x - box->left < 2 || box->right - x < 2 ||
+             y - box->top < 2 || box->bottom - y < 2)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *event_data,
@@ -91,7 +142,7 @@ static esp_lcd_panel_handle_t initialize_lcd(void)
 
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = -1,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
     esp_lcd_panel_handle_t panel = NULL;
@@ -188,9 +239,14 @@ void app_main(void)
     clear_lcd(panel);
     esp_lcd_touch_handle_t touch = initialize_touch();
     initialize_camera();
+    void *face_detector = face_detection_create();
+    if (face_detector == NULL) {
+        ESP_LOGE(TAG, "Face detector initialization failed");
+    }
     ESP_LOGI(TAG, "Live preview started; tap the display to log touch coordinates");
 
     bool was_touched = false;
+    size_t previous_face_count = SIZE_MAX;
     while (true) {
         camera_fb_t *frame = esp_camera_fb_get();
         if (frame == NULL) {
@@ -202,6 +258,21 @@ void app_main(void)
         if (frame->format == PIXFORMAT_RGB565 &&
             frame->width == CAMERA_FRAME_WIDTH && frame->height == CAMERA_FRAME_HEIGHT) {
             const uint16_t *source_pixels = (const uint16_t *)frame->buf;
+            face_detection_box_t detected_faces[MAX_DETECTED_FACES];
+            size_t face_count = 0;
+            if (face_detector != NULL) {
+                face_count = face_detection_run(face_detector, source_pixels,
+                                                CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT,
+                                                detected_faces, MAX_DETECTED_FACES);
+            }
+            if (face_count != previous_face_count) {
+                ESP_LOGI(TAG, "Faces detected: %zu", face_count);
+                previous_face_count = face_count;
+            }
+            face_overlay_box_t overlay_boxes[MAX_DETECTED_FACES];
+            const size_t overlay_count = map_face_boxes(
+                detected_faces, face_count, overlay_boxes, MAX_DETECTED_FACES);
+
             for (int band_y = 0; band_y < LCD_V_RES; band_y += LCD_CLEAR_BAND_HEIGHT) {
                 for (int band_row = 0; band_row < LCD_CLEAR_BAND_HEIGHT; band_row++) {
                     const size_t destination_y = (size_t)(band_y + band_row);
@@ -212,7 +283,9 @@ void app_main(void)
                         const size_t destination_index =
                             (size_t)band_row * LCD_H_RES + destination_x;
                         const size_t source_index = source_y * CAMERA_FRAME_WIDTH + source_x;
-                        clear_pixels[destination_index] = source_pixels[source_index];
+                        clear_pixels[destination_index] = is_face_edge_pixel(
+                            destination_x, band_y + band_row, overlay_boxes, overlay_count)
+                            ? 0x07E0 : source_pixels[source_index];
                     }
                 }
                 ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(
