@@ -26,7 +26,7 @@ extern "C" size_t face_detection_run(void *detector, const uint16_t *pixels,
     image.data = const_cast<uint16_t *>(pixels);
     image.width = width;
     image.height = height;
-    image.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
+    image.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
     auto *face_detector = static_cast<HumanFaceDetect *>(detector);
     const auto &results = face_detector->run(image);
