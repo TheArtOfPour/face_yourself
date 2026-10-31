@@ -4,6 +4,7 @@
 
 #include "driver/spi_master.h"
 #include "esp_camera.h"
+#include "esp_err.h"
 #include "esp_lcd_ili9341.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
@@ -13,14 +14,16 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #define LCD_HOST SPI2_HOST
 #define LCD_H_RES 240
 #define LCD_V_RES 320
 #define LCD_CLEAR_BAND_HEIGHT 40
-#define CAMERA_FRAME_WIDTH 240
-#define CAMERA_FRAME_HEIGHT 176
-#define CAMERA_PREVIEW_Y ((LCD_V_RES - CAMERA_FRAME_HEIGHT) / 2)
+#define CAMERA_FRAME_WIDTH 320
+#define CAMERA_FRAME_HEIGHT 240
+#define CAMERA_CROP_WIDTH 180
+#define CAMERA_CROP_X ((CAMERA_FRAME_WIDTH - CAMERA_CROP_WIDTH) / 2)
 
 #define PIN_NUM_LCD_SCLK 7
 #define PIN_NUM_LCD_MISO 8
@@ -46,6 +49,23 @@
 
 static const char *TAG = "camera_lcd";
 static uint16_t clear_pixels[LCD_H_RES * LCD_CLEAR_BAND_HEIGHT];
+static SemaphoreHandle_t lcd_transfer_done;
+
+static bool on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *event_data,
+                                    void *user_ctx)
+{
+    (void)panel_io;
+    (void)event_data;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR((SemaphoreHandle_t)user_ctx, &higher_priority_task_woken);
+    return higher_priority_task_woken == pdTRUE;
+}
+
+static void wait_for_lcd_transfer(void)
+{
+    xSemaphoreTake(lcd_transfer_done, portMAX_DELAY);
+}
 
 static esp_lcd_panel_handle_t initialize_lcd(void)
 {
@@ -59,8 +79,12 @@ static esp_lcd_panel_handle_t initialize_lcd(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
 
+    lcd_transfer_done = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(lcd_transfer_done != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+
     const esp_lcd_panel_io_spi_config_t lcd_io_config =
-        ILI9341_PANEL_IO_SPI_CONFIG(PIN_NUM_LCD_CS, PIN_NUM_LCD_DC, NULL, NULL);
+        ILI9341_PANEL_IO_SPI_CONFIG(PIN_NUM_LCD_CS, PIN_NUM_LCD_DC,
+                                    on_lcd_color_trans_done, lcd_transfer_done);
     esp_lcd_panel_io_handle_t lcd_io = NULL;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
                                              &lcd_io_config, &lcd_io));
@@ -88,6 +112,7 @@ static void clear_lcd(esp_lcd_panel_handle_t panel)
         ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y_start, LCD_H_RES,
                                                   y_start + LCD_CLEAR_BAND_HEIGHT,
                                                   clear_pixels));
+                            wait_for_lcd_transfer();
     }
 }
 
@@ -138,7 +163,7 @@ static void initialize_camera(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_RGB565,
-        .frame_size = FRAMESIZE_HQVGA,
+        .frame_size = FRAMESIZE_QVGA,
         .jpeg_quality = 12,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
@@ -146,9 +171,14 @@ static void initialize_camera(void)
     };
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
 
-    const sensor_t *sensor = esp_camera_sensor_get();
+    sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL) {
+        const int vertical_flip_result = sensor->set_vflip(sensor, 1);
+        const int horizontal_mirror_result = sensor->set_hmirror(sensor, 1);
         ESP_LOGI(TAG, "Camera initialized, sensor PID=0x%04x", sensor->id.PID);
+        if (vertical_flip_result != 0 || horizontal_mirror_result != 0) {
+            ESP_LOGW(TAG, "Camera sensor did not accept both orientation settings");
+        }
     }
 }
 
@@ -171,9 +201,25 @@ void app_main(void)
 
         if (frame->format == PIXFORMAT_RGB565 &&
             frame->width == CAMERA_FRAME_WIDTH && frame->height == CAMERA_FRAME_HEIGHT) {
-            ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(
-                panel, 0, CAMERA_PREVIEW_Y, LCD_H_RES,
-                CAMERA_PREVIEW_Y + CAMERA_FRAME_HEIGHT, frame->buf));
+            const uint16_t *source_pixels = (const uint16_t *)frame->buf;
+            for (int band_y = 0; band_y < LCD_V_RES; band_y += LCD_CLEAR_BAND_HEIGHT) {
+                for (int band_row = 0; band_row < LCD_CLEAR_BAND_HEIGHT; band_row++) {
+                    const size_t destination_y = (size_t)(band_y + band_row);
+                    const size_t source_y = destination_y * CAMERA_FRAME_HEIGHT / LCD_V_RES;
+                    for (int destination_x = 0; destination_x < LCD_H_RES; destination_x++) {
+                        const size_t source_x = CAMERA_CROP_X +
+                            (size_t)destination_x * CAMERA_CROP_WIDTH / LCD_H_RES;
+                        const size_t destination_index =
+                            (size_t)band_row * LCD_H_RES + destination_x;
+                        const size_t source_index = source_y * CAMERA_FRAME_WIDTH + source_x;
+                        clear_pixels[destination_index] = source_pixels[source_index];
+                    }
+                }
+                ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(
+                    panel, 0, band_y, LCD_H_RES, band_y + LCD_CLEAR_BAND_HEIGHT,
+                    clear_pixels));
+                wait_for_lcd_transfer();
+            }
         } else {
             ESP_LOGE(TAG, "Unexpected camera frame: %zux%zu format=%d",
                      frame->width, frame->height, frame->format);
@@ -181,15 +227,13 @@ void app_main(void)
         esp_camera_fb_return(frame);
 
         ESP_ERROR_CHECK(esp_lcd_touch_read_data(touch));
-        uint16_t touch_x[1];
-        uint16_t touch_y[1];
-        uint16_t touch_strength[1];
+        esp_lcd_touch_point_data_t touch_point = {0};
         uint8_t point_count = 0;
-        const bool is_touched = esp_lcd_touch_get_coordinates(
-            touch, touch_x, touch_y, touch_strength, &point_count, 1);
-        if (is_touched && !was_touched && point_count > 0) {
+        ESP_ERROR_CHECK(esp_lcd_touch_get_data(touch, &touch_point, &point_count, 1));
+        const bool is_touched = point_count > 0;
+        if (is_touched && !was_touched) {
             ESP_LOGI(TAG, "Touch: x=%u y=%u strength=%u",
-                     touch_x[0], touch_y[0], touch_strength[0]);
+                     touch_point.x, touch_point.y, touch_point.strength);
         }
         was_touched = is_touched;
     }
